@@ -186,9 +186,6 @@ def test_line_info(func: str):
     except BaseException:
         pytest.skip("disassembler is not available")
 
-    if func == "dot_combine":
-        pytest.skip("FIXME: dot_combine doesn't work with 16 threads-per-warp")
-
     shape = (128, )
     kernel_info = {}
     if func == "single":
@@ -259,9 +256,3 @@ def test_line_info_interpreter(func: str):
         expected_def_lineno = 72
     kernel.rewrite()
     assert kernel.rewriter.def_file_lineno == expected_def_lineno
-    if func == "autotune":
-        assert kernel.rewriter.last_decorator_lineno == 7
-        assert kernel.rewriter.def_lineno == 8
-    else:
-        assert kernel.rewriter.last_decorator_lineno == 1
-        assert kernel.rewriter.def_lineno == 2

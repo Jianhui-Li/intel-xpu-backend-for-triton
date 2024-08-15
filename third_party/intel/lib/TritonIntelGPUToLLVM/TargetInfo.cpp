@@ -169,6 +169,18 @@ void TargetInfo::printf(RewriterBase &rewriter, Value formatStrStart,
   call(funcOp, operands);
 }
 
+void TargetInfo::printf(RewriterBase &rewriter, StringRef msg,
+                        ValueRange args) const {
+  assert(!msg.empty() && "printf with empty string not supported");
+  llvm::SmallString<64> msgNewline(msg);
+  msgNewline.push_back('\n');
+  msgNewline.push_back('\0');
+  Value msgValue =
+      LLVM::addStringToModule(UnknownLoc::get(rewriter.getContext()), rewriter,
+                              "printfFormat_", msgNewline);
+  printf(rewriter, msgValue, msgNewline.size_in_bytes(), args);
+}
+
 static LLVM::LLVMFuncOp getAssertfailDeclaration(RewriterBase &rewriter) {
   auto moduleOp = rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
   StringRef funcName = "__assert_fail";
@@ -200,22 +212,27 @@ void TargetInfo::assertFail(RewriterBase &rewriter, Location loc,
   auto funcOp = getAssertfailDeclaration(rewriter);
   auto moduleOp = rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
   unsigned addrSpace = TritonGEN::TritonGENMemorySpace::kCrossWorkgroup;
-  Value messageString = LLVM::intel::addStringToModule(
-      loc, rewriter, "assertMessage_", message, addrSpace);
-  Value fileString = LLVM::intel::addStringToModule(
-      loc, rewriter, "assertFile_", file, addrSpace);
-  Value funcString = LLVM::intel::addStringToModule(
-      loc, rewriter, "assertFunc_", func, addrSpace);
+  llvm::SmallString<64> messageString(message), fileString(file),
+      funcString(func);
+  messageString.push_back('\0');
+  fileString.push_back('\0');
+  funcString.push_back('\0');
+  Value messageStringVal = LLVM::intel::addStringToModule(
+      loc, rewriter, "assertMessage_", messageString, addrSpace);
+  Value fileStringVal = LLVM::intel::addStringToModule(
+      loc, rewriter, "assertFile_", fileString, addrSpace);
+  Value funcStringVal = LLVM::intel::addStringToModule(
+      loc, rewriter, "assertFunc_", funcString, addrSpace);
   Value lineNumber = i32_val(line);
 
   auto *ctx = rewriter.getContext();
   SmallVector<Value> operands;
   Value messageStringPtr = addrspacecast(
-      ptr_ty(ctx, TritonGEN::TritonGENMemorySpace::kGeneric), messageString);
+      ptr_ty(ctx, TritonGEN::TritonGENMemorySpace::kGeneric), messageStringVal);
   Value fileStringPtr = addrspacecast(
-      ptr_ty(ctx, TritonGEN::TritonGENMemorySpace::kGeneric), fileString);
+      ptr_ty(ctx, TritonGEN::TritonGENMemorySpace::kGeneric), fileStringVal);
   Value funcStringPtr = addrspacecast(
-      ptr_ty(ctx, TritonGEN::TritonGENMemorySpace::kGeneric), funcString);
+      ptr_ty(ctx, TritonGEN::TritonGENMemorySpace::kGeneric), funcStringVal);
   operands = {messageStringPtr, fileStringPtr, lineNumber, funcStringPtr};
   auto ret = call(funcOp, operands);
   ret.setCConv(LLVM::cconv::CConv::SPIR_FUNC);

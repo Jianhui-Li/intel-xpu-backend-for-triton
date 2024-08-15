@@ -1,6 +1,6 @@
 // RUN: triton-opt -convert-tritongen-to-llvm -split-input-file %s | FileCheck %s
 
-// CHECK-DAG: llvm.func spir_funccc @_Z25__spirv_BuiltInSubgroupIdv() -> i32
+// CHECK-DAG: llvm.func spir_funccc @_Z16get_sub_group_idv() -> i32
 // CHECK-DAG: llvm.func spir_funccc @_Z14get_num_groupsj(i32) -> i64 attributes {passthrough = ["nounwind", "willreturn", ["memory", "0"]]}
 // CHECK-DAG: llvm.func spir_funccc @_Z14get_local_sizej(i32) -> i64 attributes {passthrough = ["nounwind", "willreturn", ["memory", "0"]]}
 // CHECK-DAG: llvm.func spir_funccc @_Z12get_group_idj(i32) -> i64 attributes {passthrough = ["nounwind", "willreturn", ["memory", "0"]]}
@@ -49,7 +49,7 @@ llvm.func @gen_special_regs() -> i32 {
   // CHECK: llvm.call spir_funccc @_Z14get_num_groupsj([[TWO3]]) {{.*}} : (i32) -> i64
   %12 = triton_gen.grid.dim.z : i32
 
-  // CHECK: llvm.call spir_funccc @_Z25__spirv_BuiltInSubgroupIdv() {{.*}} : () -> i32
+  // CHECK: llvm.call spir_funccc @_Z16get_sub_group_idv() {{.*}} : () -> i32
   %13 = triton_gen.subgroup.id : i32
 
   llvm.return %1 : i32
@@ -61,9 +61,12 @@ llvm.func @gen_special_regs() -> i32 {
 
 llvm.func @triton_gen.barrier() {
   // CHECK-LABEL: triton_gen.barrier
-  // CHECK: [[CST:%.*]] = llvm.mlir.constant(1 : i32) : i32
-  // CHECK: llvm.call spir_funccc @_Z7barrierj([[CST]]) {{.*}} : (i32) -> ()
-  triton_gen.barrier
+  // CHECK: [[LOCAL:%.*]] = llvm.mlir.constant(1 : i32) : i32
+  // CHECK: llvm.call spir_funccc @_Z7barrierj([[LOCAL]]) {{.*}} : (i32) -> ()
+  // CHECK: [[GLOBAL:%.*]] = llvm.mlir.constant(2 : i32) : i32
+  // CHECK: llvm.call spir_funccc @_Z7barrierj([[GLOBAL]]) {{.*}} : (i32) -> ()
+  triton_gen.barrier {mem_fence=Local}
+  triton_gen.barrier {mem_fence=Global}
   llvm.return
 }
 
@@ -142,13 +145,13 @@ module attributes {
 
 // -----
 
-// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_addi(i32) -> i32 attributes {passthrough = ["convergent"]}
-// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_muli(i32) -> i32 attributes {passthrough = ["convergent"]}
-// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_mini(i32) -> i32 attributes {passthrough = ["convergent"]}
-// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_maxi(i32) -> i32 attributes {passthrough = ["convergent"]}
-// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_andi(i32) -> i32 attributes {passthrough = ["convergent"]}
-// CHECK-DAG: llvm.func spir_funccc @_Z31sub_group_non_uniform_reduce_ori(i32) -> i32 attributes {passthrough = ["convergent"]}
-// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_xori(i32) -> i32 attributes {passthrough = ["convergent"]}
+// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_addi(i32) -> i32
+// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_muli(i32) -> i32
+// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_mini(i32) -> i32
+// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_maxi(i32) -> i32
+// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_andi(i32) -> i32
+// CHECK-DAG: llvm.func spir_funccc @_Z31sub_group_non_uniform_reduce_ori(i32) -> i32
+// CHECK-DAG: llvm.func spir_funccc @_Z32sub_group_non_uniform_reduce_xori(i32) -> i32
 
 module attributes {
   spirv.target_env = #spirv.target_env<#spirv.vce<v1.4, [Kernel, Addresses, GroupNonUniformShuffle, Int64], []>, #spirv.resource_limits<subgroup_size = 16>>
@@ -375,5 +378,27 @@ llvm.func @triton_gen.dpas.bf16_accum(%c: vector<8xbf16>, %a : vector<8xi16>, %b
   // CHECK-SAME:    : (vector<8xi16>, vector<8xi32>, vector<8xi16>) -> vector<8xi16>
   %0 = triton_gen.dpas %c, %a, %b {pa = bf16, pb = bf16, rc = 8} : (vector<8xbf16>, vector<8xi16>, vector<8xi32>) -> vector<8xbf16>
   // CHECK-NEXT: {{%.*}} = llvm.bitcast [[RES]] : vector<8xi16> to vector<8xbf16>
+  llvm.return
+}
+
+// -----
+
+// CHECK: llvm.func spir_funccc @llvm.genx.GenISA.simdBlockRead(!llvm.ptr<3>) -> vector<64xi16>
+
+llvm.func @triton_gen.simdblockread(%ptr: !llvm.ptr<3>) {
+  // CHECK:     llvm.func @triton_gen.simdblockread(%arg0: !llvm.ptr<3>) {
+  // CHECK:       llvm.call spir_funccc @llvm.genx.GenISA.simdBlockRead(%arg0) {{.*}} : (!llvm.ptr<3>) -> vector<64xi16>
+  %ret = triton_gen.simdblockread %ptr : (!llvm.ptr<3>) -> vector<64xi16>
+  llvm.return
+}
+
+// -----
+
+// CHECK: llvm.func spir_funccc @llvm.genx.GenISA.simdBlockWrite(!llvm.ptr<3>, vector<64xi16>)
+
+llvm.func @triton_gen.simdblockwrite(%ptr: !llvm.ptr<3>, %val : vector<64xi16>) {
+  // CHECK:     llvm.func @triton_gen.simdblockwrite(%arg0: !llvm.ptr<3>, %arg1: vector<64xi16>) {
+  // CHECK:       llvm.call spir_funccc @llvm.genx.GenISA.simdBlockWrite(%arg0, %arg1) {{.*}} : (!llvm.ptr<3>, vector<64xi16>) -> ()
+  triton_gen.simdblockwrite %ptr, %val : (!llvm.ptr<3>, vector<64xi16>)
   llvm.return
 }

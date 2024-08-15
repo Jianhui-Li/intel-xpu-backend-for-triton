@@ -20,18 +20,27 @@ This is the development repository of Intel® XPU Backend for Triton\*, a new [T
 # Install from source
 
 ```
-git clone https://github.com/intel/intel-xpu-backend-for-triton.git -b llvm-target
-cd intel-xpu-backend-for-triton
-scripts/compile-triton.sh
+git clone https://github.com/intel/intel-xpu-backend-for-triton.git;
+cd intel-xpu-backend-for-triton;
+
+pip install ninja cmake wheel; # build-time dependencies
+pip install -e python
 ```
 
 Or with a virtualenv:
 
 ```
-git clone https://github.com/intel/intel-xpu-backend-for-triton.git -b llvm-target
-cd intel-xpu-backend-for-triton
-scripts/compile-triton.sh --venv
+git clone https://github.com/intel/intel-xpu-backend-for-triton.git;
+cd intel-xpu-backend-for-triton;
+
+python -m venv .venv --prompt triton;
+source .venv/bin/activate;
+
+pip install ninja cmake wheel; # build-time dependencies
+pip install -e python
 ```
+
+Note that `$HOME/.triton` folder is used as default cache location at build time. Developers might find `scripts/compile-triton.sh` script useful for advanced build options.
 
 # Building with a custom LLVM
 
@@ -155,10 +164,11 @@ For detailed instructions on how to debug Triton's frontend, please refer to thi
   separated values to be specified (eg
   `TRITON_LLVM_DEBUG_ONLY="tritongpu-remove-layout-conversions` or
   `TRITON_LLVM_DEBUG_ONLY="tritongpu-remove-layout-conversions,regalloc"`).
-- `USE_TTGIR_LOC=1` reparses the ttgir such that the location information will
-  be the line number of the ttgir instead of line number of the python file.
-  This can provide a direct mapping from ttgir to llir/ptx. When used with
-  performance tools, it can provide a breakdown on ttgir instructions.
+- `USE_IR_LOC={ttir,ttgir}` reparses the IR such that the location information
+  will be the line number of the IR file with that particular extension,
+  instead of line number of the python file. This can provide a direct mapping
+  from the IR to llir/ptx. When used with performance tools, it can provide a
+  breakdown on IR instructions.
 - `TRITON_PRINT_AUTOTUNING=1` prints out the best autotuning config and total time
   spent for each kernel after autotuning is complete.
 - `DISABLE_LLVM_OPT` will disable llvm optimizations for make_llir and make_ptx

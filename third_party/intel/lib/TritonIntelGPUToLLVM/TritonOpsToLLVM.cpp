@@ -7,6 +7,8 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "llvm/ADT/ArrayRef.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -14,9 +16,15 @@ using namespace mlir::triton::gpu::intel;
 
 namespace {
 
+// Note: this macro is used to explicitly invoke the verifier because
+// `triton_gen` ops are immediately lowered further to a builtin call.
+#define VERIFY_OPERATION(op)                                                   \
+  if (failed(op.verify()))                                                     \
+    return failure();
+
 VectorType getVectorType(RankedTensorType tensorType, Type elemType) {
   // Determine a vector type of the given `elemType` that covers 1/16 of
-  // `tensorType`, i.e. the amout of data a single subgroup lane will work on.
+  // `tensorType`, i.e. the amount of data a single subgroup lane will work on.
   size_t tensorSize =
       tensorType.getNumElements() * tensorType.getElementTypeBitWidth();
   size_t num = (tensorSize / 16) / elemType.getIntOrFloatBitWidth();
@@ -122,8 +130,8 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     auto ptrType = cast<PointerType>(op.getPtr().getType());
     auto tensorType = cast<RankedTensorType>(ptrType.getPointeeType());
-    assert(tensorType.getRank() <= 2 &&
-           "only support 1d/2d load/store/prefetch for now");
+    assert(tensorType.getRank() == 2 &&
+           "only support 2d load/store/prefetch for now");
 
     Type elemType = tensorType.getElementType();
     unsigned dataSize = elemType.getIntOrFloatBitWidth();
@@ -142,7 +150,11 @@ public:
       vBlks = ceil(blockWidth, blockWidthUnit);
       blockWidth = blockWidthUnit;
     }
-    assert((vBlks == 1 || vBlks == 2) && "only support 1 or 2 blocks");
+    bool isLocalSpace = (ptrType.getAddressSpace() ==
+                         TritonGEN::TritonGENMemorySpace::kWorkgroup);
+
+    assert(isLocalSpace ||
+           (vBlks == 1 || vBlks == 2) && "only support 1 or 2 blocks");
 
     Value ptr = op.getPtr();
     if (auto cast =
@@ -159,7 +171,11 @@ public:
 
     OpBuilder::InsertPoint insertPoint = rewriter.saveInsertionPoint();
     rewriter.setInsertionPointAfter(ptrOp);
+    if (isLocalSpace)
+      return rewriteLocalSpace(op, base, insertPoint, adaptor, rewriter);
+
     Location loc = op.getLoc();
+    bool transpose = ptrOp.getOrder()[0] == 0;
     Value bytes =
         i32_val(tensorType.getElementType().getIntOrFloatBitWidth() / 8);
 
@@ -170,9 +186,9 @@ public:
       return truncatedShape;
     };
 
-    Value surfaceW = calculateSurface(ptrOp.getShape()[1], true);
-    Value surfaceH = calculateSurface(ptrOp.getShape()[0], false);
-    Value surfaceP = calculateSurface(ptrOp.getStrides()[0], true);
+    Value surfaceW = calculateSurface(ptrOp.getShape()[!transpose], true);
+    Value surfaceH = calculateSurface(ptrOp.getShape()[transpose], false);
+    Value surfaceP = calculateSurface(ptrOp.getStrides()[transpose], true);
     rewriter.restoreInsertionPoint(insertPoint);
 
     Value tensorPtr = adaptor.getPtr();
@@ -189,24 +205,33 @@ public:
           getVectorType(cast<RankedTensorType>(op.getResult().getType()),
                         isDword ? i32_ty : i16_ty);
       bool vnni = (idx == 1) && dataSize < 32;
+
+      // FIXME: only support fp16/bf16 transpose for now, add more support like
+      // tf32 and fp8.
+      if (transpose) {
+        assert(getElementBitWidth(tensorType) == 16 &&
+               "only support 16-bit element type for now");
+        vnni = false;
+        dataSize = 32;
+        blockWidth /= 2;
+        Value tmp = offsetX;
+        offsetX = lshr(offsetY, i32_val(1));
+        offsetY = tmp;
+      }
       auto load = rewriter.create<TritonGEN::Matrix2DBlockLoadOp>(
           loc, vectorType, base, surfaceW, surfaceH, surfaceP, offsetX, offsetY,
           dataSize, blockWidth, blockHeight, vBlks, false /*transpose*/, vnni);
-      if (failed(load.verify())) {
-        // Explicitly invoke verifier because `triton_gen` ops are immediately
-        // lowered further to a builtin call.
-        return failure();
-      }
+      VERIFY_OPERATION(load)
+
       rewriter.replaceOp(op, bitcast(load, resType));
     } else if constexpr (std::is_same_v<OpType, PrefetchOp>) {
+      if (transpose)
+        std::swap(offsetX, offsetY);
       auto newOp = rewriter.create<TritonGEN::Matrix2DBlockPrefetchOp>(
           loc, base, surfaceW, surfaceH, surfaceP, offsetX, offsetY, dataSize,
           blockWidth, blockHeight, vBlks, TritonGEN::LoadCacheControl::L1C_L3C);
-      if (failed(newOp.verify())) {
-        // Explicitly invoke verifier because `triton_gen` ops are immediately
-        // lowered further to a builtin call.
-        return failure();
-      }
+      VERIFY_OPERATION(newOp)
+
       rewriter.eraseOp(op);
     } else {
       VectorType vectorType =
@@ -216,15 +241,75 @@ public:
           loc, base, surfaceW, surfaceH, surfaceP, offsetX, offsetY, dataSize,
           blockWidth, blockHeight, vBlks,
           bitcast(adaptor.getValue(), vectorType));
-      if (failed(newOp.verify())) {
-        // Explicitly invoke verifier because `triton_gen` ops are immediately
-        // lowered further to a builtin call.
-        return failure();
-      }
+      VERIFY_OPERATION(newOp)
+
       rewriter.eraseOp(op);
     }
 
     return success();
+  }
+
+private:
+  LogicalResult rewriteLocalSpace(OpType op, Value base,
+                                  OpBuilder::InsertPoint insertPoint,
+                                  typename OpType::Adaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const {
+    auto ptrType = cast<PointerType>(op.getPtr().getType());
+    assert(ptrType.getAddressSpace() ==
+               TritonGEN::TritonGENMemorySpace::kWorkgroup &&
+           "expecting local space");
+
+    MLIRContext *ctx = rewriter.getContext();
+    Location loc = op.getLoc();
+    Value llPtr = adaptor.getPtr();
+    if (auto cast =
+            dyn_cast<mlir::UnrealizedConversionCastOp>(llPtr.getDefiningOp()))
+      llPtr = cast.getInputs()[0];
+
+    // sg_size(16) x i64 = 64 x i16
+    VectorType v64i16Ty = VectorType::get(64, i16_ty);
+    LLVM::LLVMPointerType ptrToSharedMemTy =
+        ptr_ty(ctx, ptrType.getAddressSpace());
+    Value offsetX = extract_element(llPtr, i32_val(0));
+    Value offsetY = extract_element(llPtr, i32_val(1));
+
+    Value blkId = add(mul(udiv(offsetY, i32_val(8)), i32_val(4)),
+                      udiv(offsetX, i32_val(16)));
+    Value index = mul(blkId, i32_val(128));
+    base = gep(ptrToSharedMemTy, i16_ty, base, index);
+
+    if constexpr (std::is_same_v<OpType, LoadOp>) {
+      VectorType v64f16Ty = VectorType::get(64, f16_ty);
+
+      rewriter.restoreInsertionPoint(insertPoint);
+
+      TritonGEN::SIMDBlockReadOp simdRead =
+          rewriter.create<TritonGEN::SIMDBlockReadOp>(loc, v64i16Ty, base);
+      rewriter.replaceOp(op, simdRead.getRes());
+
+      return success();
+    }
+
+    if constexpr (std::is_same_v<OpType, StoreOp>) {
+      rewriter.restoreInsertionPoint(insertPoint);
+      Value val = adaptor.getValue();
+      if (auto shuffleOp =
+              dyn_cast_or_null<LLVM::ShuffleVectorOp>(val.getDefiningOp()))
+        val = shuffleOp.getRes();
+      if (isa<LLVM::LLVMStructType>(val.getType())) {
+        SmallVector<Value> unpackedVal = unpackLLElements(loc, val, rewriter);
+        val = packLLVector(loc, unpackedVal, rewriter);
+      }
+      val = bitcast(val, v64i16Ty);
+
+      TritonGEN::SIMDBlockWriteOp simdWrite =
+          rewriter.create<TritonGEN::SIMDBlockWriteOp>(loc, base, val);
+
+      rewriter.eraseOp(op);
+      return success();
+    }
+
+    return failure();
   }
 };
 
@@ -328,8 +413,16 @@ public:
       rewriter.replaceOpWithNewOp<LLVM::ShuffleVectorOp>(op, dstType, shfl01,
                                                          shfl23, attr);
     } break;
-    default:
-      llvm_unreachable("add more support for glue op to llvm");
+    default: {
+      unsigned num = operands.size();
+      Value undef = undef(dstType);
+      for (unsigned i = 0; i < num; ++i)
+        undef =
+            insert_element(dstType, undef, operands[i],
+                           rewriter.create<LLVM::ConstantOp>(loc, i32_ty, i));
+
+      rewriter.replaceOp(op, undef);
+    }
     }
 
     return success();
@@ -346,16 +439,119 @@ public:
   LogicalResult
   matchAndRewrite(ExtractOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
     Value base = adaptor.getBase();
-    auto dstType =
-        cast<VectorType>(getTypeConverter()->convertType(op.getType()));
-    unsigned numElts = dstType.getNumElements();
-    SmallVector<int32_t> indices(numElts);
-    unsigned start = op.getIndex() * numElts;
-    std::iota(indices.begin(), indices.end(), start);
-    DenseI32ArrayAttr attr = rewriter.getDenseI32ArrayAttr(indices);
-    rewriter.replaceOpWithNewOp<LLVM::ShuffleVectorOp>(op, dstType, base, base,
-                                                       attr);
+    unsigned idx = adaptor.getIndex();
+    Type dstType = getTypeConverter()->convertType(op.getType());
+    Value result;
+    if (auto vecTy = dyn_cast<VectorType>(dstType)) {
+      unsigned numElts = vecTy.getNumElements();
+      SmallVector<int32_t> indices(numElts);
+      unsigned start = idx * numElts;
+      std::iota(indices.begin(), indices.end(), start);
+      result = rewriter.create<LLVM::ShuffleVectorOp>(
+          loc, vecTy, base, base, rewriter.getDenseI32ArrayAttr(indices));
+    } else {
+      Value idxVal = rewriter.create<LLVM::ConstantOp>(loc, i32_ty, idx);
+      result = extract_element(base, idxVal);
+    }
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+class SplatOpConversion : public ConvertTritonGPUOpToLLVMPattern<SplatOp> {
+public:
+  using ConvertTritonGPUOpToLLVMPattern<
+      SplatOp>::ConvertTritonGPUOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(SplatOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    RankedTensorType resultType = op.getType();
+    TritonIntelGPUToLLVMTypeConverter *typeConverter = getTypeConverter();
+    Type srcTy = adaptor.getSrc().getType();
+    VectorType vecTy = VectorType::get(1, srcTy);
+    auto poison = rewriter.create<LLVM::PoisonOp>(loc, vecTy);
+    auto splat =
+        insert_element(vecTy, poison, adaptor.getSrc(),
+                       rewriter.create<LLVM::ConstantOp>(loc, i32_ty, 0));
+    Type convertedTy = typeConverter->convertType(resultType);
+    int64_t num = cast<VectorType>(convertedTy).getNumElements();
+    SmallVector<int32_t> indices(num, 0);
+    Value result = rewriter.create<LLVM::ShuffleVectorOp>(
+        loc, convertedTy, splat, poison,
+        rewriter.getDenseI32ArrayAttr(indices));
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+class ReduceOpConversion : public ConvertTritonGPUOpToLLVMPattern<ReduceOp> {
+public:
+  using ConvertTritonGPUOpToLLVMPattern<
+      ReduceOp>::ConvertTritonGPUOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(ReduceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto mod = op->getParentOfType<mlir::ModuleOp>();
+    int subgroupSize = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+    int axis = op.getAxis();
+    ArrayRef<int64_t> shape =
+        cast<RankedTensorType>(op.getInputTypes()[0]).getShape();
+    assert(shape[axis] <= subgroupSize &&
+           "Reduce size should be split into subgroups");
+
+    Location loc = op.getLoc();
+    Type resultType = op.getType(0);
+    TritonIntelGPUToLLVMTypeConverter *typeConverter = getTypeConverter();
+    Type convertedTy = typeConverter->convertType(resultType);
+    Region &combineOp = op.getCombineOp();
+    if (!combineOp.hasOneBlock() ||
+        combineOp.front().getOperations().size() != 2)
+      return failure();
+
+    Operation *combine = &*combineOp.front().getOperations().begin();
+
+    // FIXME: support all possible reduction modes
+    using AllReduceOperation = mlir::gpu::AllReduceOperation;
+    AllReduceOperation redKind;
+    if (isa<arith::AddFOp>(combine))
+      redKind = AllReduceOperation::ADD;
+    else if (isa<arith::MaxNumFOp>(combine))
+      redKind = AllReduceOperation::MAXNUMF;
+    else
+      llvm_unreachable("Unhandled reduction kind");
+
+    Value result = rewriter.create<mlir::gpu::SubgroupReduceOp>(
+        loc, convertedTy, adaptor.getSrcs()[0], redKind, true);
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+class ExpandDimsOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<ExpandDimsOp> {
+public:
+  using ConvertTritonGPUOpToLLVMPattern<
+      ExpandDimsOp>::ConvertTritonGPUOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(ExpandDimsOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getSrc());
+    return success();
+  }
+};
+
+class BroadcastOpConversion
+    : public ConvertTritonGPUOpToLLVMPattern<triton::BroadcastOp> {
+public:
+  using ConvertTritonGPUOpToLLVMPattern<
+      triton::BroadcastOp>::ConvertTritonGPUOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(triton::BroadcastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getSrc());
     return success();
   }
 };
@@ -373,8 +569,8 @@ public:
     Type resultPtrTy = typeConverter->convertType(resultType);
     Type resultElmTy = typeConverter->convertType(
         cast<PointerType>(resultType).getPointeeType());
-    Value result = rewriter.create<LLVM::GEPOp>(
-        loc, resultPtrTy, resultElmTy, adaptor.getPtr(), adaptor.getOffset());
+    Value result =
+        gep(resultPtrTy, resultElmTy, adaptor.getPtr(), adaptor.getOffset());
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -385,14 +581,18 @@ public:
 void mlir::triton::intel::populateTritonOpsToLLVMPatterns(
     TritonIntelGPUToLLVMTypeConverter &typeConverter,
     RewritePatternSet &patterns, PatternBenefit benefit) {
-  patterns.add<MakeTensorPtrOpConversion>(typeConverter, benefit);
+  patterns.add<AddPtrOpConversion>(typeConverter, benefit);
   patterns.add<AdvanceOpConversion>(typeConverter, benefit);
+  patterns.add<BroadcastOpConversion>(typeConverter, benefit);
   patterns.add<DotOpConversion>(typeConverter, benefit);
+  patterns.add<ExpandDimsOpConversion>(typeConverter, benefit);
+  patterns.add<ExtractOpConversion>(typeConverter, benefit);
+  patterns.add<GlueOpConversion>(typeConverter, benefit);
   patterns.add<LoadStorePrefetchOpConversion<PrefetchOp>>(typeConverter,
                                                           benefit);
   patterns.add<LoadStorePrefetchOpConversion<LoadOp>>(typeConverter, benefit);
   patterns.add<LoadStorePrefetchOpConversion<StoreOp>>(typeConverter, benefit);
-  patterns.add<GlueOpConversion>(typeConverter, benefit);
-  patterns.add<ExtractOpConversion>(typeConverter, benefit);
-  patterns.add<AddPtrOpConversion>(typeConverter, benefit);
+  patterns.add<MakeTensorPtrOpConversion>(typeConverter, benefit);
+  patterns.add<ReduceOpConversion>(typeConverter, benefit);
+  patterns.add<SplatOpConversion>(typeConverter, benefit);
 }

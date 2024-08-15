@@ -15,7 +15,7 @@ namespace triton {
 void LoadOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
-  effects.emplace_back(MemoryEffects::Read::get(), getPtr(),
+  effects.emplace_back(MemoryEffects::Read::get(), &getPtrMutable(),
                        triton::GlobalMemory::get());
   if (getIsVolatile())
     effects.emplace_back(MemoryEffects::Write::get(),
@@ -226,7 +226,8 @@ LogicalResult TransOp::inferReturnTypes(
   }
   if (auto memDescTy = dyn_cast<MemDescType>(argTy)) {
     inferredReturnTypes.push_back(MemDescType::get(
-        retShape, retEltTy, retEncoding, memDescTy.getMemorySpace()));
+        retShape, retEltTy, retEncoding, memDescTy.getMemorySpace(),
+        memDescTy.getMutableMemory()));
   } else {
     inferredReturnTypes.push_back(
         RankedTensorType::get(retShape, retEltTy, retEncoding));
@@ -339,8 +340,8 @@ LogicalResult MakeRangeOp::verify() {
 
 //-- ReduceOp --
 static LogicalResult
-inferReduceReturnShape(const RankedTensorType &argTy, const Type &retEltTy,
-                       int axis, SmallVectorImpl<Type> &inferredReturnTypes) {
+inferReduceReturnShape(RankedTensorType argTy, Type retEltTy, int axis,
+                       SmallVectorImpl<Type> &inferredReturnTypes) {
   auto retShape = argTy.getShape().vec();
   retShape.erase(retShape.begin() + axis);
   if (retShape.empty()) {

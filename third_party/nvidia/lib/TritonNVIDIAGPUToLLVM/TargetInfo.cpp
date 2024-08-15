@@ -385,8 +385,8 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   auto st = builder.create<>("st")
                 ->o("shared::cta", ctaId.has_value())
                 .o("shared", !ctaId.has_value())
-                .b(elemBitwidth)
-                .v(vec, /*predicate=*/vec > 1);
+                .v(vec, /*predicate=*/vec > 1)
+                .b(elemBitwidth);
   auto *ptrOpr = builder.newAddrOperand(ptr, "r");
 
   PTXBuilder::Operand *valOpr;
@@ -641,6 +641,18 @@ void TargetInfo::printf(RewriterBase &rewriter, Value formatStrStart,
 
   SmallVector<Value> operands{formatStrStart, bufferPtr};
   call(funcOp, operands);
+}
+
+void TargetInfo::printf(RewriterBase &rewriter, StringRef msg,
+                        ValueRange args) const {
+  assert(!msg.empty() && "printf with empty string not supported");
+  llvm::SmallString<64> msgNewline(msg);
+  msgNewline.push_back('\n');
+  msgNewline.push_back('\0');
+  Value msgValue =
+      LLVM::addStringToModule(UnknownLoc::get(rewriter.getContext()), rewriter,
+                              "printfFormat_", msgNewline);
+  printf(rewriter, msgValue, msgNewline.size_in_bytes(), args);
 }
 
 void TargetInfo::assertFail(RewriterBase &rewriter, Location loc,

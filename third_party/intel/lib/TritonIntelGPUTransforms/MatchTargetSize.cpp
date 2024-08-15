@@ -48,10 +48,13 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include "intel/include/Dialect/TritonGEN/IR/TritonGENDialect.h"
 #include "intel/include/Dialect/TritonIntelGPU/IR/Dialect.h"
 #include "intel/include/Dialect/TritonIntelGPU/Transforms/Passes.h"
 
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 namespace mlir::triton::gpu::intel {
 #define GEN_PASS_DEF_TRITONINTELGPUMATCHTARGETSIZE
@@ -63,6 +66,7 @@ namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttgi = mlir::triton::gpu::intel;
 
+#undef DEBUG_TYPE
 #define DEBUG_TYPE "tritonintelgpu-match-target-size"
 
 namespace {
@@ -128,6 +132,141 @@ private:
   unsigned loadStoreSize = 0;
 };
 
+static tt::LoadOp findUsedLoad(Value val) {
+  tt::LoadOp loadOp;
+  auto defOp = val.getDefiningOp();
+  if (isa_and_nonnull<tt::LoadOp>(defOp))
+    return cast<tt::LoadOp>(defOp);
+  for (auto u : defOp->getOperands()) {
+    if (tt::LoadOp ld = findUsedLoad(u)) {
+      loadOp = ld;
+      break;
+    }
+  }
+  return loadOp;
+}
+
+static bool getTransposeFlagFromValue(Value val) {
+  bool isTransposed = false;
+  Value loadPtr = val;
+  // backward: from dot operands to tt.load
+  if (llvm::any_of(val.getUsers(),
+                   [](Operation *user) { return isa<tt::DotOp>(user); })) {
+    // is a dot operand
+    tt::LoadOp load = findUsedLoad(val);
+    if (load)
+      loadPtr = load.getPtr();
+  }
+
+  if (auto extractOp =
+          dyn_cast_or_null<ttgi::ExtractOp>(loadPtr.getDefiningOp())) {
+    loadPtr = extractOp.getBase();
+  }
+  // forward: from tt.load/tt.advance to dot
+  if (auto blockArg = dyn_cast<BlockArgument>(loadPtr)) {
+    unsigned argIdx = blockArg.getArgNumber();
+    if (auto loopLikeOp = dyn_cast<LoopLikeOpInterface>(
+            blockArg.getParentBlock()->getParentOp())) {
+      auto inits = llvm::to_vector(loopLikeOp.getInits());
+      if (auto glueOp =
+              dyn_cast<ttgi::GlueOp>(inits[argIdx - 1].getDefiningOp())) {
+        if (auto tempPtr = dyn_cast<tt::MakeTensorPtrOp>(
+                glueOp.getOperands()[0].getDefiningOp())) {
+          loadPtr = tempPtr.getResult();
+        }
+      }
+    }
+  }
+
+  if (auto tensorPtr = loadPtr.getDefiningOp<tt::MakeTensorPtrOp>()) {
+    ArrayRef<int32_t> order = tensorPtr.getOrder();
+    auto rank = order.size();
+    isTransposed = (order[rank - 2] != 1);
+  }
+  return isTransposed;
+}
+
+static void rewriteLoadWithSLM(ModuleOp &m, DenseSet<Value> &dotWithSLMOperands,
+                               MLIRContext *ctx) {
+  // FIXME: Use a cost model to decide when to do rewrite
+  dotWithSLMOperands.clear();
+  auto funcsVec = llvm::to_vector(m.getBody()->getOps<tt::FuncOp>());
+  if (funcsVec.size() == 0)
+    return;
+
+  auto loadsVec = llvm::to_vector(funcsVec[0].getBody().getOps<tt::LoadOp>());
+  if (loadsVec.size() == 0)
+    return;
+  tt::LoadOp load = loadsVec[0];
+
+  // load is not in a loop-like op
+  if (load->getParentOfType<LoopLikeOpInterface>())
+    return;
+
+  auto dot = cast<tt::DotOp>(*load->getUsers().begin());
+  // load is not used by tt.dot
+  if (llvm::none_of(load->getUsers(),
+                    [&](Operation *user) { return isa<tt::DotOp>(user); }))
+    return;
+
+  auto loopOp = dyn_cast_or_null<LoopLikeOpInterface>(dot->getParentOp());
+  // skip dot which is not in a loop
+  if (!loopOp)
+    return;
+
+  Location loc = load.getLoc();
+  OpBuilder b(load);
+  auto type = cast<RankedTensorType>(load.getType());
+  unsigned bytes = type.getNumElements() * type.getElementTypeBitWidth() / 8;
+  unsigned numWarps = ttg::TritonGPUDialect::getNumWarps(m);
+  unsigned slmSize = numWarps * bytes;
+
+  // TODO: use LocalAllocOp for SLM allocation
+  static constexpr char sharedAttr[] = "triton_gpu.shared";
+  m->setAttr(sharedAttr,
+             mlir::IntegerAttr::get(mlir::IntegerType::get(ctx, 32), slmSize));
+  auto func = load->getParentOfType<FunctionOpInterface>();
+
+  auto ptrToSharedMemTy = tt::PointerType::get(
+      type.getElementType(), TritonGEN::TritonGENMemorySpace::kWorkgroup);
+  func.insertArgument(func.getNumArguments(), ptrToSharedMemTy, {},
+                      func.getLoc());
+  b.setInsertionPointAfter(load);
+  auto subgroupId =
+      b.create<mlir::gpu::SubgroupIdOp>(loc, /*upperBound=*/nullptr);
+  auto warpId = b.create<arith::IndexCastOp>(loc, b.getI32Type(), subgroupId);
+  // hardcode: we use i16ptr here, so bytes / 2
+  auto warpSize = b.create<arith::ConstantIntOp>(loc, bytes / 2, 32);
+  auto offset = b.create<arith::MulIOp>(loc, warpId, warpSize);
+  auto block = load->getBlock();
+  auto arg = block->getArgument(block->getNumArguments() - 1);
+  auto base = b.create<tt::AddPtrOp>(loc, ptrToSharedMemTy, arg, offset);
+  SmallVector<Value> shape;
+  shape.push_back(b.create<arith::ConstantIntOp>(loc, type.getShape()[0], 64));
+  shape.push_back(b.create<arith::ConstantIntOp>(loc, type.getShape()[1], 64));
+  SmallVector<Value> strides;
+  strides.push_back(
+      b.create<arith::ConstantIntOp>(loc, type.getShape()[1], 64));
+  strides.push_back(b.create<arith::ConstantIntOp>(loc, 1, 64));
+  SmallVector<Value> offsets;
+  offsets.push_back(b.create<arith::ConstantIntOp>(loc, 0, 32));
+  offsets.push_back(b.create<arith::ConstantIntOp>(loc, 0, 32));
+  auto loadPtrTy = cast<tt::PointerType>(load.getPtr().getType());
+  auto ptrTy = tt::PointerType::get(loadPtrTy.getPointeeType(), 3);
+  auto ptr =
+      b.create<tt::MakeTensorPtrOp>(loc, ptrTy, base, shape, strides, offsets,
+                                    b.getDenseI32ArrayAttr({1, 0}));
+  auto store = b.create<tt::StoreOp>(loc, ptr, load, tt::CacheModifier::NONE,
+                                     tt::EvictionPolicy::NORMAL);
+
+  b.setInsertionPoint(dot);
+  auto newLoad =
+      b.create<tt::LoadOp>(dot.getLoc(), ptr, tt::CacheModifier::NONE,
+                           tt::EvictionPolicy::NORMAL, false);
+  Value res = load.getResult();
+  dotWithSLMOperands.insert(dot);
+  res.replaceAllUsesExcept(newLoad, store);
+}
 class MatchTargetSizePass
     : public triton::gpu::intel::impl::TritonIntelGPUMatchTargetSizeBase<
           MatchTargetSizePass> {
@@ -137,6 +276,9 @@ public:
 
     MLIRContext *ctx = &getContext();
     ModuleOp m = getOperation();
+    // this is ad-hoc for flash attention load/store Q on SLM
+    if (tools::getBoolEnv("TRITON_INTEL_ENABLE_FIRST_LOAD_TO_SLM"))
+      rewriteLoadWithSLM(m, dotWithSLMOperands, ctx);
 
     // Collect the result layout of "interesting" `tt.dot` operations.
     // A candidate 'tt.dot' operation yields a tensor with a warp layout.
@@ -175,10 +317,10 @@ public:
                hasSliceAttr(op->getResultTypes()[0]))
         return WalkResult::advance();
       else if (auto cstOp = dyn_cast<arith::ConstantOp>(op)) {
-        recordRootSubSize(cstOp.getResult().getType());
+        recordRootSubSize(op);
         transformArithConstantOp(cstOp);
       } else if (auto ptrOp = dyn_cast<tt::MakeTensorPtrOp>(op)) {
-        recordRootSubSize(ptrOp.getResult().getType());
+        recordRootSubSize(op);
         transformMakeTensorPtrOp(ptrOp);
       } else if (auto dot = dyn_cast<tt::DotOp>(op))
         transformDotOp(dot);
@@ -218,10 +360,14 @@ private:
   /// Canonicalize operations (e.g. remove redundant tt.extract, tt.glue)
   void canonicalize();
 
-  void recordRootSubSize(Type type);
-  SmallVector<int64_t> getSubOpSize(RankedTensorType type) const;
+  void recordRootSubSize(Operation *op);
+  SmallVector<int64_t> getSubOpSize(RankedTensorType op,
+                                    bool isTransposed) const;
+
   std::tuple<SmallVector<int64_t>, Type, SmallVector<int64_t>>
-  getSubTypeAndShape(Type type) const;
+  getSubTypeAndShape(Type type, bool isTransposed = false,
+                     bool useSLM = false) const;
+
   Value getSubVal(Operation *op, Value val, ArrayRef<int64_t> srcOffset,
                   ArrayRef<int64_t> dstSize);
 
@@ -238,11 +384,18 @@ private:
   /// Record the native size supported by the target implementation.
   DenseMap<Attribute, SmallVector<int64_t>> sizePerAttrMap;
 
+  /// Record the native size supported by the target implementation for
+  /// transposed type.
+  DenseMap<Attribute, SmallVector<int64_t>> sizePerAttrMapTransposed;
+
   /// Collects the result layout of the `tt.dot` operations in the module.
   DenseSet<Attribute> dotAttrs;
 
   /// The native operation sizes supported by the target architecture.
   TargetArchNativeSizes nativeSizes;
+
+  /// Dot ops that use operands from SLM(outer loop)
+  DenseSet<Value> dotWithSLMOperands;
 };
 
 /// Simplify arith operations with constant RHS.
@@ -373,11 +526,12 @@ public:
       }
 
       auto glue = cast<ttgi::GlueOp>(definingOp);
-      for (Operation *user : result.getUsers())
+      for (Operation *user : result.getUsers()) {
         if (auto extract = dyn_cast<ttgi::ExtractOp>(user)) {
           userIndexMap[extract] = idx + extract.getIndex();
           deleteList.push_back(extract.getOperation());
         }
+      }
 
       idx += glue->getOperands().size();
     }
@@ -412,10 +566,16 @@ public:
 
       if (llvm::any_of(arg.getUsers(), [](Operation *user) {
             return !isa<ttgi::ExtractOp>(user);
-          })) {
+          }))
         return false;
-      }
     }
+
+    // Bail out if the loop result is not used by an 'extract' operation.
+    if (forOp->getNumResults() == 1 &&
+        llvm::any_of(forOp.getResult(0).getUsers(), [](Operation *user) {
+          return !isa<ttgi::ExtractOp>(user);
+        }))
+      return false;
 
     return true;
   }
@@ -475,22 +635,42 @@ void MatchTargetSizePass::canonicalize() {
     signalPassFailure();
 }
 
-void MatchTargetSizePass::recordRootSubSize(Type type) {
+void MatchTargetSizePass::recordRootSubSize(Operation *op) {
+  Type type;
+  bool isTransposed = false;
+  if (auto cstOp = dyn_cast<arith::ConstantOp>(op)) {
+    type = cstOp.getResult().getType();
+  } else if (auto tensorPtrOp = dyn_cast<tt::MakeTensorPtrOp>(op)) {
+    type = tensorPtrOp.getResult().getType();
+    ArrayRef<int32_t> order = tensorPtrOp.getOrder();
+    auto rank = order.size();
+    isTransposed = (order[rank - 2] != 1);
+  }
+
+  auto ptrType = dyn_cast<tt::PointerType>(type);
+  // extract until a non-PointerType
+  while (isa_and_nonnull<tt::PointerType>(ptrType)) {
+    type = ptrType.getPointeeType();
+    ptrType = dyn_cast<tt::PointerType>(type);
+  }
+
   if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
     Attribute layout = tensorType.getEncoding();
     assert(layout && "Expecting a valid layout");
-    if (sizePerAttrMap.count(layout) == 0)
-      sizePerAttrMap[layout] = getSubOpSize(tensorType);
+    if (isTransposed && sizePerAttrMapTransposed.count(layout) == 0) {
+      sizePerAttrMapTransposed[layout] = getSubOpSize(tensorType, isTransposed);
+    }
+    if (!isTransposed && sizePerAttrMap.count(layout) == 0) {
+      sizePerAttrMap[layout] = getSubOpSize(tensorType, isTransposed);
+    }
     return;
   }
-
-  if (auto ptrType = dyn_cast<tt::PointerType>(type))
-    recordRootSubSize(ptrType.getPointeeType());
 }
 
 /// Return the native size supported by the target architecture.
 SmallVector<int64_t>
-MatchTargetSizePass::getSubOpSize(RankedTensorType type) const {
+MatchTargetSizePass::getSubOpSize(RankedTensorType type,
+                                  bool isTransposed) const {
   Attribute layout = type.getEncoding();
   assert(layout && "Expecting a valid layout");
 
@@ -500,7 +680,7 @@ MatchTargetSizePass::getSubOpSize(RankedTensorType type) const {
   if (dotAttrs.count(layout)) {
     return {dotShape.m, dotShape.n};
   } else if (auto dotAttr = dyn_cast<ttg::DotOperandEncodingAttr>(layout)) {
-    if (dotAttr.getIsTransposed() == 1 && dotAttr.getOpIdx() == 1)
+    if (isTransposed && dotAttr.getOpIdx() == 1)
       return {dotShape.k, dotShape.n};
   }
 
@@ -552,12 +732,21 @@ MatchTargetSizePass::getSubOpSize(RankedTensorType type) const {
 /// FIXME: add a map for look up
 /// return [shape, subType, subSize] for a tensor (or pointer to tensor)
 std::tuple<SmallVector<int64_t>, Type, SmallVector<int64_t>>
-MatchTargetSizePass::getSubTypeAndShape(Type type) const {
+MatchTargetSizePass::getSubTypeAndShape(Type type, bool isTransposed,
+                                        bool useSLM) const {
   if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
     Attribute layout = tensorType.getEncoding();
     assert(layout && "Expecting a valid layout");
     SmallVector<int64_t> shape = to_vector(tensorType.getShape());
-    SmallVector<int64_t> subSize = sizePerAttrMap.at(layout);
+    SmallVector<int64_t> subSize = isTransposed
+                                       ? sizePerAttrMapTransposed.at(layout)
+                                       : sizePerAttrMap.at(layout);
+    // specific for flash attention
+    if (useSLM) {
+      subSize[0] = 16;
+      subSize[1] = 64;
+    }
+
     auto subType = RankedTensorType::get(
         subSize, tensorType.getElementType() /*no encoding*/);
     return {shape, subType, subSize};
@@ -565,7 +754,8 @@ MatchTargetSizePass::getSubTypeAndShape(Type type) const {
 
   if (auto ptrType = dyn_cast<tt::PointerType>(type)) {
     Type pointeeType = ptrType.getPointeeType();
-    auto [shape, subType, subSize] = getSubTypeAndShape(pointeeType);
+    auto [shape, subType, subSize] =
+        getSubTypeAndShape(pointeeType, isTransposed, useSLM);
     auto newType = tt::PointerType::get(subType, ptrType.getAddressSpace());
     return {shape, newType, subSize};
   }
@@ -660,7 +850,14 @@ void MatchTargetSizePass::transformReduceOp(tt::ReduceOp op) {
 
 void MatchTargetSizePass::transformMakeTensorPtrOp(tt::MakeTensorPtrOp op) {
   Type resultType = op.getResult().getType();
-  auto [shape, subType, subSize] = getSubTypeAndShape(resultType);
+  ArrayRef<int32_t> order = op.getOrder();
+  auto rank = order.size();
+  bool isTransposed = (order[rank - 2] != 1);
+  bool useSLM = (cast<tt::PointerType>(resultType).getAddressSpace() ==
+                 TritonGEN::TritonGENMemorySpace::kWorkgroup);
+  auto [shape, subType, subSize] =
+      getSubTypeAndShape(resultType, isTransposed, useSLM);
+
   unsigned dim = shape.size();
   OpBuilder b(op);
   Location loc = op.getLoc();
@@ -691,6 +888,7 @@ void MatchTargetSizePass::transformMakeTensorPtrOp(tt::MakeTensorPtrOp op) {
         auto subOp = b.create<tt::MakeTensorPtrOp>(
             loc, op.getBase(), op.getShape(), op.getStrides(), newOffsets,
             subShape, op.getOrder());
+        subOp.getResult().setType(dyn_cast<tt::PointerType>(subType));
         subOps.push_back(subOp);
       }
     } break;
@@ -749,8 +947,17 @@ void MatchTargetSizePass::transformDotOp(tt::DotOp dot) {
   Location loc = dot.getLoc();
 
   auto getSubDotVal = [&](Value val, int64_t mm, int64_t kk, int64_t mStep,
-                          int64_t kStep) {
-    auto [shape, subType, subSize] = getSubTypeAndShape(val.getType());
+                          int64_t kStep, bool useSLM = false) {
+    bool isTransposed = false;
+    if (auto dotEnc = dyn_cast<DotOperandEncodingAttr>(
+            cast<RankedTensorType>(val.getType()).getEncoding())) {
+      // FIXME: Just transposed B supported now
+      if (dotEnc.getOpIdx() == 1) {
+        isTransposed = getTransposeFlagFromValue(val);
+      }
+    }
+    auto [shape, subType, subSize] =
+        getSubTypeAndShape(val.getType(), isTransposed, useSLM);
     unsigned subIdx =
         (kk / subSize[1]) * (shape[0] / subSize[0]) + mm / subSize[0];
     Value subVal = b.create<ttgi::ExtractOp>(loc, subType, val, subIdx);
@@ -767,13 +974,18 @@ void MatchTargetSizePass::transformDotOp(tt::DotOp dot) {
     for (unsigned mm = 0; mm < m; mm += dotShape.m) {
       Value subDotC = getSubDotVal(dot.getC(), mm, nn, dotShape.m, dotShape.n);
       for (unsigned kk = 0; kk < k; kk += dotShape.k) {
-        Value subDotA =
-            getSubDotVal(dot.getA(), mm, kk, dotShape.m, dotShape.k);
+        Value subDotA = getSubDotVal(dot.getA(), mm, kk, dotShape.m, dotShape.k,
+                                     dotWithSLMOperands.count(dot));
         Value subDotB =
             getSubDotVal(dot.getB(), kk, nn, dotShape.k, dotShape.n);
         subDotC = b.create<tt::DotOp>(loc, subDotA, subDotB, subDotC,
                                       dot.getInputPrecisionAttr(),
                                       dot.getMaxNumImpreciseAccAttr());
+        // hack for attention
+        if (triton::tools::getBoolEnv("TRITON_INTEL_ENABLE_INSTR_SCHED"))
+          subDotC.getDefiningOp()->setAttr(
+              "schedule-group",
+              b.getIntegerAttr(b.getI32Type(), nn / dotShape.n));
       }
       subCs.push_back(subDotC);
     }
@@ -822,6 +1034,7 @@ void MatchTargetSizePass::transformGenericOp(Operation *op) {
   unsigned dotIdx = 2;
   Type type;
 
+  bool isTransposed = false;
   switch (numResults) {
   case 0:
     // prefetch/store
@@ -830,11 +1043,27 @@ void MatchTargetSizePass::transformGenericOp(Operation *op) {
   case 1: {
     // arith/math/advanceOp/loadOp
     type = op->getResultTypes()[0];
-    // mark tt.load for dot A/B
-    if (auto tensorType = dyn_cast<RankedTensorType>(type))
-      if (isa<tt::LoadOp>(op)) {
+    // mark tt.load/tt.advance for dot A/B
+    if (isa<RankedTensorType, tt::PointerType>(type))
+      if (isa<tt::LoadOp, tt::AdvanceOp>(op)) {
+        RankedTensorType tensorType;
+        if (isa<RankedTensorType>(type))
+          tensorType = dyn_cast<RankedTensorType>(type);
+        else
+          tensorType = dyn_cast<RankedTensorType>(
+              dyn_cast<tt::PointerType>(type).getPointeeType());
         Attribute layout = tensorType.getEncoding();
         assert(layout && "Expecting a valid layout");
+
+        tt::LoadOp load = dyn_cast<tt::LoadOp>(op);
+        tt::AdvanceOp advOp = dyn_cast<tt::AdvanceOp>(op);
+        Value loadPtr;
+        if (load)
+          loadPtr = load.getPtr();
+        else
+          loadPtr = advOp.getPtr();
+
+        isTransposed = getTransposeFlagFromValue(loadPtr);
         if (auto dotAttr = dyn_cast<ttg::DotOperandEncodingAttr>(layout))
           dotIdx = dotAttr.getOpIdx();
       }
@@ -843,7 +1072,21 @@ void MatchTargetSizePass::transformGenericOp(Operation *op) {
     llvm_unreachable("Unexpected operation");
   }
 
-  auto [shape, subType, subSize] = getSubTypeAndShape(type);
+  // for attention SLM
+  bool useSLM = false;
+  if (auto store = dyn_cast<tt::StoreOp>(op)) {
+    auto ptrAS =
+        cast<tt::PointerType>(store.getPtr().getType()).getAddressSpace();
+    useSLM = (ptrAS == TritonGEN::TritonGENMemorySpace::kWorkgroup);
+  }
+  if (auto load = dyn_cast<tt::LoadOp>(op)) {
+    auto ptrAS =
+        cast<tt::PointerType>(load.getPtr().getType()).getAddressSpace();
+    useSLM = (ptrAS == TritonGEN::TritonGENMemorySpace::kWorkgroup);
+  }
+  auto [shape, subType, subSize] =
+      getSubTypeAndShape(type, isTransposed, useSLM);
+
   unsigned dim = shape.size();
   OpBuilder b(op);
   Location loc = op->getLoc();
@@ -859,8 +1102,8 @@ void MatchTargetSizePass::transformGenericOp(Operation *op) {
                         [&](Value operand) {
                           Type type = operand.getType();
                           if (isa<tt::PointerType, RankedTensorType>(type)) {
-                            Type subOpndType =
-                                std::get<1>(getSubTypeAndShape(type));
+                            Type subOpndType = std::get<1>(
+                                getSubTypeAndShape(type, isTransposed, useSLM));
                             Value newOp = b.create<ttgi::ExtractOp>(
                                 loc, subOpndType, operand, idx);
                             return newOp;
